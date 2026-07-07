@@ -11,3 +11,15 @@ dist/
 *.egg-info/
 .gradle/
 xcuserdata/
+
+# secrets and generated (2026-07-07)
+graphify-out/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+.credentials.json
+.session.json
+*.session
