@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+.venv.nosync/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+.build/
+build/
+dist/
+*.egg-info/
+.gradle/
+xcuserdata/
