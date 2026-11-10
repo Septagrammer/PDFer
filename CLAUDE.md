@@ -192,3 +192,7 @@ Both application and instrumented-test APKs built, but instrumented tests and UI
 were not run: no connected Android device or configured AVD was available. Pending
 manual checks include delete cancel/confirm, revoked VIEW URI, rapid page changes while
 rendering the original, settings slider persistence, Best retry and storage failure UI.
+
+Delivery: implementation commit `79ea4a5` was pushed to `origin/main`.
+Installation was not performed: `adb devices` and `emulator -list-avds` returned
+no devices or configured AVDs. Device verification and installation remain pending.
