@@ -93,6 +93,11 @@ class ReaderViewModel(
     private val _highlight = MutableStateFlow<String?>(null)
     val highlight: StateFlow<String?> = _highlight.asStateFlow()
 
+    private val _progressError = MutableStateFlow<String?>(null)
+    val progressError: StateFlow<String?> = _progressError.asStateFlow()
+
+    fun dismissProgressError() { _progressError.value = null }
+
     private var current = ReaderSettings()
     private var variant = current.ocrVariant
     private var settingsLoaded = false
@@ -102,6 +107,8 @@ class ReaderViewModel(
     private var prefetchJob: Job? = null
     private var searchJob: Job? = null
     private var downloadJob: Job? = null
+    private var originalJob: Job? = null
+    private var progressJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -132,18 +139,31 @@ class ReaderViewModel(
 
     // --- navigation ---
 
-    fun goTo(index: Int) {
+    fun goTo(index: Int, preserveHighlight: Boolean = false) {
         val target = index.coerceIn(0, (pageCount - 1).coerceAtLeast(0))
         val settled = _content.value !is PageContent.Loading && _content.value !is PageContent.Error
         if (target == _page.value && settled) return   // allow retry when Error/Loading
+        if (!preserveHighlight) _highlight.value = null
         _page.value = target
-        doc?.let { library.saveLastPage(it.id, target, System.currentTimeMillis()) }
+        doc?.let { document ->
+            // Only the final page in a fast sequence is allowed to persist its progress.
+            progressJob?.cancel()
+            progressJob = viewModelScope.launch {
+                try {
+                    library.saveLastPage(document.id, target, System.currentTimeMillis())
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (_: Exception) {
+                    if (isActive) _progressError.value = "Could not save reading progress. Check available storage and try changing the page again."
+                }
+            }
+        }
         loadPage(target)
     }
 
-    // Manual paging drops any active search highlight; openHit() uses goTo() directly to keep it.
-    fun next() { _highlight.value = null; goTo(_page.value + 1) }
-    fun prev() { _highlight.value = null; goTo(_page.value - 1) }
+    // Manual paging drops any active search highlight; openHit() explicitly keeps it.
+    fun next() = goTo(_page.value + 1)
+    fun prev() = goTo(_page.value - 1)
 
     // --- OCR pipeline ---
 
@@ -296,6 +316,7 @@ class ReaderViewModel(
             _content.value = PageContent.Error("Cannot open this PDF.")
             return
         }
+        originalJob?.cancel()
         _original.value?.recycle()      // release the previous page's "view original" bitmap
         _original.value = null
         ocrJob?.cancel()
@@ -307,7 +328,9 @@ class ReaderViewModel(
             } catch (c: CancellationException) {
                 throw c                  // let a superseded page flip cancel cleanly
             } catch (e: Exception) {
-                _content.value = PageContent.Error(e.message ?: "OCR failed")
+                if (isActive && index == _page.value) {
+                    _content.value = PageContent.Error(e.message ?: "OCR failed")
+                }
                 return@launch
             }
             // A faster page flip may have superseded us while OCR was running.
@@ -333,17 +356,29 @@ class ReaderViewModel(
 
     /** Render the current page image for the "view original" overlay. */
     fun loadOriginal() {
-        if (source == null || _original.value != null) return
+        if (source == null || _original.value != null || originalJob?.isActive == true) return
         val index = _page.value
-        viewModelScope.launch {
-            val bmp = runCatching {
+        originalJob = viewModelScope.launch {
+            // Capture ownership inside the worker: cancellation can discard a
+            // withContext return value before dispatching back to the main thread.
+            var rendered: Bitmap? = null
+            try {
                 renderMutex.withLock {
                     withContext(Dispatchers.Default) {
-                        source.render(index, targetDpi = 200).downscaled(2200)
+                        rendered = source.render(index, targetDpi = 200).downscaled(2200)
                     }
                 }
-            }.getOrNull()
-            _original.value = bmp
+                if (isActive && index == _page.value) {
+                    _original.value = rendered
+                    rendered = null
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (_: Exception) {
+                // Leave the overlay empty so rendering can be retried.
+            } finally {
+                rendered?.recycle()
+            }
         }
     }
 
@@ -361,6 +396,8 @@ class ReaderViewModel(
             }
         }
     }
+
+    fun retryBestDownload() = downloadBest()
 
     // --- full-text search ---
 
@@ -389,7 +426,7 @@ class ReaderViewModel(
 
     fun openHit(hit: SearchHit, query: String) {
         _highlight.value = query
-        goTo(hit.page)
+        goTo(hit.page, preserveHighlight = true)
     }
 
     fun clearSearch() {
@@ -399,7 +436,7 @@ class ReaderViewModel(
     }
 
     override fun onCleared() {
-        ocrJob?.cancel(); prefetchJob?.cancel(); searchJob?.cancel(); downloadJob?.cancel()
+        ocrJob?.cancel(); prefetchJob?.cancel(); searchJob?.cancel(); downloadJob?.cancel(); originalJob?.cancel(); progressJob?.cancel()
         _original.value?.recycle()
         source?.close()
     }

@@ -9,6 +9,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URL
 
 /**
@@ -26,6 +29,7 @@ class TessManager(private val appContext: Context) {
     private val langs = Langs.ALL.split("+")
 
     private val mutex = Mutex()
+    private val provisioningMutex = Mutex()
     private val engines = HashMap<OcrQuality, TessBaseAPI>()
 
     // --- trained data provisioning ---
@@ -36,8 +40,19 @@ class TessManager(private val appContext: Context) {
         for (name in assets.list("tessdata").orEmpty()) {
             val out = File(tessdata, name)
             if (out.exists() && out.length() > 0) continue
-            assets.open("tessdata/$name").use { input ->
-                out.outputStream().use { input.copyTo(it) }
+            val tmp = File(tessdata, "$name.part")
+            try {
+                assets.open("tessdata/$name").use { input ->
+                    FileOutputStream(tmp).use { output ->
+                        input.copyTo(output)
+                        output.fd.sync()
+                    }
+                }
+                if (tmp.length() == 0L || !tmp.renameTo(out)) {
+                    throw IOException("Could not provision OCR model $name")
+                }
+            } finally {
+                tmp.delete()
             }
         }
     }
@@ -49,30 +64,44 @@ class TessManager(private val appContext: Context) {
 
     /** Download the tessdata_best models. [onProgress] gets a 0..1 fraction. */
     suspend fun downloadBest(onProgress: (Float) -> Unit): Boolean = withContext(Dispatchers.IO) {
-        val tessdata = File(bestDir, "tessdata").apply { mkdirs() }
-        val base = "https://github.com/tesseract-ocr/tessdata_best/raw/main"
-        try {
-            langs.forEachIndexed { i, lang ->
-                val out = File(tessdata, "$lang.traineddata")
-                if (out.exists() && out.length() > 0) {
-                    onProgress((i + 1f) / langs.size); return@forEachIndexed
-                }
-                val tmp = File(tessdata, "$lang.part")
-                try {
-                    URL("$base/$lang.traineddata").openStream().use { input ->
-                        tmp.outputStream().use { input.copyTo(it, 64 * 1024) }
+        provisioningMutex.withLock {
+            val tessdata = File(bestDir, "tessdata").apply { mkdirs() }
+            val base = "https://github.com/tesseract-ocr/tessdata_best/raw/main"
+            try {
+                langs.forEachIndexed { i, lang ->
+                    val out = File(tessdata, "$lang.traineddata")
+                    if (out.exists() && out.length() > 0) {
+                        onProgress((i + 1f) / langs.size); return@forEachIndexed
                     }
-                    // out appears atomically only once fully written, so bestAvailable()
-                    // never sees a half-downloaded model.
-                    if (!tmp.renameTo(out)) tmp.copyTo(out, overwrite = true)
-                } finally {
-                    tmp.delete()   // never leave orphaned .part files on failure
+                    val tmp = File(tessdata, "$lang.part")
+                    val connection = URL("$base/$lang.traineddata").openConnection() as HttpURLConnection
+                    try {
+                        connection.connectTimeout = 15_000
+                        connection.readTimeout = 30_000
+                        if (connection.responseCode !in 200..299) {
+                            throw IOException("OCR model download failed: HTTP ${connection.responseCode}")
+                        }
+                        connection.inputStream.use { input ->
+                            FileOutputStream(tmp).use { output ->
+                                input.copyTo(output, 64 * 1024)
+                                output.fd.sync()
+                            }
+                        }
+                        // A model becomes visible only after its complete temporary file
+                        // has been synced and atomically switched into place.
+                        if (tmp.length() == 0L || !tmp.renameTo(out)) {
+                            throw IOException("Could not install OCR model $lang")
+                        }
+                    } finally {
+                        connection.disconnect()
+                        tmp.delete()
+                    }
+                    onProgress((i + 1f) / langs.size)
                 }
-                onProgress((i + 1f) / langs.size)
+                true
+            } catch (_: Exception) {
+                false
             }
-            true
-        } catch (e: Exception) {
-            false
         }
     }
 

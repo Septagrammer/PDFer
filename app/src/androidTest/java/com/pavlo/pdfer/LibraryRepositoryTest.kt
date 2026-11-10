@@ -1,11 +1,14 @@
 package com.pavlo.pdfer
 
+import android.content.ContextWrapper
 import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.pavlo.pdfer.data.DocumentRef
 import com.pavlo.pdfer.data.LibraryRepository
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -20,9 +23,10 @@ class LibraryRepositoryTest {
 
     private val ctx: Context get() = ApplicationProvider.getApplicationContext()
 
-    private fun newPdfFile(): File {
+    private fun newPdfFile(uniqueSuffix: String = ""): File {
         val f = File.createTempFile("libtest", ".pdf", ctx.cacheDir)
         TestFixtures.writeOnePagePdf(f)
+        if (uniqueSuffix.isNotEmpty()) f.appendText("\n% $uniqueSuffix")
         return f
     }
 
@@ -66,7 +70,7 @@ class LibraryRepositoryTest {
     }
 
     @Test
-    fun saveLastPageUpdatesDoc() {
+    fun saveLastPageClampsToDocumentBounds() {
         val repo = LibraryRepository(ctx)
         val src = newPdfFile()
         var doc: DocumentRef? = null
@@ -75,8 +79,8 @@ class LibraryRepositoryTest {
             val id = doc!!.id
             assertEquals(0, repo.byId(id)?.lastPage)
 
-            repo.saveLastPage(id, page = 5, nowMs = 4_000L)
-            assertEquals(5, repo.byId(id)?.lastPage)
+            runBlocking { repo.saveLastPage(id, page = 5, nowMs = 4_000L) }
+            assertEquals(0, repo.byId(id)?.lastPage)
             assertEquals(4_000L, repo.byId(id)?.lastOpenedAt)
         } finally {
             src.delete()
@@ -103,6 +107,27 @@ class LibraryRepositoryTest {
     }
 
     @Test
+    fun concurrentImportsOfSameContentCreateOneLibraryRecord() {
+        val repo = LibraryRepository(ctx)
+        val src = newPdfFile("parallel-${System.nanoTime()}")
+        var doc: DocumentRef? = null
+        try {
+            val imported = runBlocking {
+                awaitAll(
+                    async { repo.import(Uri.fromFile(src), nowMs = 8_000L) },
+                    async { repo.import(Uri.fromFile(src), nowMs = 9_000L) },
+                )
+            }
+            doc = imported.first()
+            assertEquals(imported.first().id, imported.last().id)
+            assertEquals(1, repo.docs.value.count { it.id == doc!!.id })
+        } finally {
+            src.delete()
+            doc?.let { runBlocking { repo.delete(it) } }
+        }
+    }
+
+    @Test
     fun deleteRemovesFromFlowAndDeletesFile() {
         val repo = LibraryRepository(ctx)
         val src = newPdfFile()
@@ -119,4 +144,51 @@ class LibraryRepositoryTest {
             src.delete()
         }
     }
+
+    @Test
+    fun deleteCleansTheStoredFileNotAStaleCallerFileName() {
+        val repo = LibraryRepository(ctx)
+        val src = newPdfFile("canonical-delete-${System.nanoTime()}")
+        var doc: DocumentRef? = null
+        var sentinel: File? = null
+        try {
+            doc = runBlocking { repo.import(Uri.fromFile(src), nowMs = 10_000L) }
+            val stale = doc!!.copy(fileName = "unrelated.pdf")
+            sentinel = repo.file(stale).apply { writeText("must remain") }
+
+            runBlocking { repo.delete(stale) }
+
+            assertFalse("stored PDF must be deleted", repo.file(doc!!).exists())
+            assertTrue("caller-controlled filename must not be deleted", sentinel!!.exists())
+        } finally {
+            src.delete()
+            sentinel?.delete()
+            doc?.let { runBlocking { repo.delete(it) } }
+        }
+    }
+    @Test
+    fun failedProgressCommitDoesNotPublishUnpersistedState() {
+        val root = File(ctx.cacheDir, "failed-commit-${System.nanoTime()}").apply { mkdirs() }
+        val isolated = object : ContextWrapper(ctx) {
+            override fun getFilesDir() = File(root, "files").apply { mkdirs() }
+            override fun getCacheDir() = File(root, "cache").apply { mkdirs() }
+        }
+        val repo = LibraryRepository(isolated)
+        val src = newPdfFile("failed-commit-${System.nanoTime()}")
+        try {
+            val doc = runBlocking { repo.import(Uri.fromFile(src), nowMs = 1_000L) }
+            val index = File(isolated.filesDir, "library.json")
+            check(index.delete())
+            check(index.mkdir()) // A directory cannot be replaced by the index rename.
+            val failure = runCatching {
+                runBlocking { repo.saveLastPage(doc.id, page = 0, nowMs = 2_000L) }
+            }
+            assertTrue("commit failure must reach caller", failure.isFailure)
+            assertEquals(doc, repo.byId(doc.id))
+        } finally {
+            src.delete()
+            root.deleteRecursively()
+        }
+    }
+
 }

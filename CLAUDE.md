@@ -3,7 +3,7 @@
 Android app for comfortably reading PDFs - including badly scanned ones. OCRs each
 page (Tesseract, on-device), detects columns, and reflows the recognized text into a
 clean, adjustable reading view (font/size/spacing/theme). A "view original" button
-shows the raw scanned page. Personal project - no git.
+shows the raw scanned page. Personal project.
 
 ## Stack
 - Kotlin + Jetpack Compose, single `:app` module, MVVM, no DI framework.
@@ -97,8 +97,11 @@ reliably caught.
 - `data/PdfPageSource` - renders a page to a bitmap at ~300dpi (capped 3000px).
 - `data/Reflow` - collapses hard line wraps within each paragraph, repairs end-of-line
   hyphenation.
-- `data/LibraryRepository` - imports (copy + SHA-256 id), recents (`library.json`),
-  last-page, and the per-page caches **keyed by variant** (`<quality>_<e0|e1>`):
+- `data/LibraryRepository` - imports (validated temporary copy + SHA-256 id), recents
+  (`library.json`), last-page, and the per-page caches **keyed by variant**
+  (`<quality>_<e0|e1>`). All library mutations are serialized; the index is atomically
+  committed before UI state is published, and logical deletion commits its index change
+  before best-effort file cleanup:
   the page layout `cacheDir/ocr/<id>/<page>_<variant>.json` (paragraphs + figure refs)
   and figure crops `<page>_<variant>_img<n>.png`. A layout cache entry is treated as a
   miss if any referenced crop file is gone. (The older plain-text `…_<variant>.txt`
@@ -150,7 +153,42 @@ crash or hang; `onNewIntent` handles a second "open PDF"; Error pages can be ret
 search highlight clears on manual paging; the page slider commits on release only;
 deskew score is normalized; best-model download cleans up `.part` files.
 
+## Logic audit (2026-08-21)
+Library writes now have one mutex-protected commit boundary, simultaneous imports dedupe
+by content id, and persisted progress is clamped to valid page bounds. Deletion requires
+confirmation. Stale original-page renders and stale OCR errors cannot replace a newer
+page. An external `ACTION_VIEW` import now reports a failure instead of silently staying
+on the previous screen. The required device checks are still: delete cancel/confirm,
+revoked VIEW URI, and changing page while original rendering is in progress.
+
+## Logic audit (2026-10-03)
+Progress persistence runs on `Dispatchers.IO` and only the latest page request remains
+eligible to save. Settings sliders keep transient values in Compose state and write
+DataStore only on release. OCR model provisioning is serialized and fail-closed: a model
+is published only after its temporary file is synced and atomically renamed, and a failed
+Best download exposes an explicit retry. The
+repository resolves deletion cleanup from its canonical stored record. Compilation and device verification were pending at that review; see the delivery checks below.
+
 ## Next ideas (not done)
 - Adaptive (Sauvola) binarization for unevenly-lit scans; despeckle.
 - Persist a search index so re-search across sessions is instant.
 - Reading progress sync / bookmarks; share/export recognized text.
+
+## Pending-change review and delivery checks (2026-11-10)
+
+The pending fixes are retained. VIEW imports now keep a stable request identity until
+completion, so the effect does not cancel itself before navigating; cancellation is
+not shown as an import error. Original-page rendering retains bitmap ownership inside
+the worker and recycles it even if cancellation discards the dispatch result.
+Progress-write failures show a separate reader dialog without crashing or replacing
+OCR content. Instrumented regressions cover successful/invalid VIEW imports and
+failed index commit without publishing unpersisted state.
+
+Validation: `:app:assembleDebug :app:testDebugUnitTest :app:assembleDebugAndroidTest`
+passed with JDK 21; 51 JVM tests passed. The current source was copied byte-for-byte
+into a temporary directory for this run because macOS rejects Java clonefile of
+resources/assets from this iCloud checkout. The temporary copy was removed afterwards.
+Both application and instrumented-test APKs built, but instrumented tests and UI flows
+were not run: no connected Android device or configured AVD was available. Pending
+manual checks include delete cancel/confirm, revoked VIEW URI, rapid page changes while
+rendering the original, settings slider persistence, Best retry and storage failure UI.

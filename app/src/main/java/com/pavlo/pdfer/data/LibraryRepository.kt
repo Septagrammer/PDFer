@@ -12,7 +12,11 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.security.MessageDigest
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Owns imported documents, the recents list, and the per-page OCR text cache.
@@ -24,6 +28,7 @@ class LibraryRepository(private val app: Context) {
     private val docsDir = File(app.filesDir, "docs").apply { mkdirs() }
     private val ocrDir = File(app.cacheDir, "ocr").apply { mkdirs() }
     private val indexFile = File(app.filesDir, "library.json")
+    private val mutationMutex = Mutex()
 
     private val _docs = MutableStateFlow(loadIndex())
     val docs: StateFlow<List<DocumentRef>> = _docs.asStateFlow()
@@ -32,9 +37,28 @@ class LibraryRepository(private val app: Context) {
         runCatching { json.decodeFromString<List<DocumentRef>>(indexFile.readText()) }
             .getOrDefault(emptyList())
 
-    private fun persist(list: List<DocumentRef>) {
-        _docs.value = list
-        runCatching { indexFile.writeText(json.encodeToString(list)) }
+    /**
+     * Commits the authoritative library index before publishing it to the UI.
+     * Call only while [mutationMutex] is held.
+     */
+    private fun persistLocked(list: List<DocumentRef>) {
+        check(list.map { it.id }.distinct().size == list.size) {
+            "Library index must not contain duplicate document ids"
+        }
+        val encoded = json.encodeToString(list).encodeToByteArray()
+        val tmp = File.createTempFile("library", ".new", indexFile.parentFile)
+        try {
+            FileOutputStream(tmp).use { out ->
+                out.write(encoded)
+                out.fd.sync()
+            }
+            // Reject a bad serialization before replacing the last known-good index.
+            json.decodeFromString<List<DocumentRef>>(tmp.readText())
+            if (!tmp.renameTo(indexFile)) throw IOException("Could not replace the library index")
+            _docs.value = list
+        } finally {
+            tmp.delete()
+        }
     }
 
     fun file(doc: DocumentRef): File = File(docsDir, doc.fileName)
@@ -51,55 +75,85 @@ class LibraryRepository(private val app: Context) {
 
         // Hash the content so re-importing the same file reuses its id and cache.
         val tmp = File.createTempFile("import", ".pdf", app.cacheDir)
-        val digest = MessageDigest.getInstance("SHA-256")
-        resolver.openInputStream(uri)!!.use { input ->
-            tmp.outputStream().use { out ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = input.read(buf); if (n < 0) break
-                    out.write(buf, 0, n); digest.update(buf, 0, n)
+        try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val input = resolver.openInputStream(uri)
+                ?: throw IOException("The selected document is no longer available")
+            input.use {
+                tmp.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = input.read(buf); if (n < 0) break
+                        out.write(buf, 0, n); digest.update(buf, 0, n)
+                    }
                 }
             }
-        }
-        val id = digest.digest().joinToString("") { "%02x".format(it) }.take(24)
+            val id = digest.digest().joinToString("") { "%02x".format(it) }.take(24)
+            // Validate the temporary copy before it can become library state.
+            val pageCount = PdfPageSource(tmp).use { it.pageCount }
 
-        byId(id)?.let { existing ->
+            mutationMutex.withLock {
+                _docs.value.firstOrNull { it.id == id }?.let { existing ->
+                    val refreshed = existing.copy(lastOpenedAt = maxOf(existing.lastOpenedAt, nowMs))
+                    persistLocked(_docs.value.map { if (it.id == id) refreshed else it })
+                    return@withLock refreshed
+                }
+
+                val fileName = "$id.pdf"
+                val destination = File(docsDir, fileName)
+                tmp.inputStream().use { input ->
+                    FileOutputStream(destination).use { output ->
+                        input.copyTo(output, 64 * 1024)
+                        output.fd.sync()
+                    }
+                }
+                if (destination.length() != tmp.length()) {
+                    throw IOException("The imported PDF was copied incompletely")
+                }
+                val doc = DocumentRef(
+                    id = id,
+                    title = displayName.removeSuffix(".pdf").removeSuffix(".PDF"),
+                    fileName = fileName,
+                    pageCount = pageCount,
+                    addedAt = nowMs,
+                    lastOpenedAt = nowMs,
+                )
+                persistLocked(listOf(doc) + _docs.value)
+                doc
+            }
+        } finally {
             tmp.delete()
-            touch(existing.id, nowMs)
-            return@withContext existing
         }
-
-        val fileName = "$id.pdf"
-        tmp.copyTo(File(docsDir, fileName), overwrite = true)
-        tmp.delete()
-
-        val pageCount = PdfPageSource(File(docsDir, fileName)).use { it.pageCount }
-        val doc = DocumentRef(
-            id = id,
-            title = displayName.removeSuffix(".pdf").removeSuffix(".PDF"),
-            fileName = fileName,
-            pageCount = pageCount,
-            addedAt = nowMs,
-            lastOpenedAt = nowMs,
-        )
-        persist(listOf(doc) + _docs.value)
-        doc
     }
 
-    fun touch(id: String, nowMs: Long) {
-        persist(_docs.value.map { if (it.id == id) it.copy(lastOpenedAt = nowMs) else it })
+    suspend fun touch(id: String, nowMs: Long) = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val existing = _docs.value.firstOrNull { it.id == id } ?: return@withLock
+            if (nowMs < existing.lastOpenedAt) return@withLock
+            persistLocked(_docs.value.map { if (it.id == id) it.copy(lastOpenedAt = nowMs) else it })
+        }
     }
 
-    fun saveLastPage(id: String, page: Int, nowMs: Long) {
-        persist(_docs.value.map {
-            if (it.id == id) it.copy(lastPage = page, lastOpenedAt = nowMs) else it
-        })
+    suspend fun saveLastPage(id: String, page: Int, nowMs: Long) = withContext(Dispatchers.IO) {
+        mutationMutex.withLock {
+            val existing = _docs.value.firstOrNull { it.id == id } ?: return@withLock
+            if (nowMs < existing.lastOpenedAt) return@withLock
+            val validPage = page.coerceIn(0, (existing.pageCount - 1).coerceAtLeast(0))
+            persistLocked(_docs.value.map {
+                if (it.id == id) it.copy(lastPage = validPage, lastOpenedAt = nowMs) else it
+            })
+        }
     }
 
     suspend fun delete(doc: DocumentRef) = withContext(Dispatchers.IO) {
-        file(doc).delete()
-        File(ocrDir, doc.id).deleteRecursively()
-        persist(_docs.value.filterNot { it.id == doc.id })
+        mutationMutex.withLock {
+            val existing = _docs.value.firstOrNull { it.id == doc.id } ?: return@withLock
+            // The logical deletion is durable before cleanup. A failed cleanup can leave
+            // only orphaned files, never an index entry that points to deleted content.
+            persistLocked(_docs.value.filterNot { it.id == doc.id })
+            file(existing).delete()
+            File(ocrDir, existing.id).deleteRecursively()
+        }
     }
 
     // --- OCR text cache (one file per page + OCR variant) ---

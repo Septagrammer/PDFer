@@ -40,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pavlo.pdfer.PdferApp
+import com.pavlo.pdfer.data.DocumentRef
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -49,6 +50,8 @@ fun LibraryScreen(app: PdferApp, onOpen: (String) -> Unit) {
     val docs by app.library.docs.collectAsState()
     var importing by remember { mutableStateOf(false) }
     var importError by remember { mutableStateOf<String?>(null) }
+    var pendingDelete by remember { mutableStateOf<DocumentRef?>(null) }
+    var deleteError by remember { mutableStateOf<String?>(null) }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -126,7 +129,7 @@ fun LibraryScreen(app: PdferApp, onOpen: (String) -> Unit) {
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                            IconButton(onClick = { scope.launch { app.library.delete(d) } }) {
+                            IconButton(onClick = { pendingDelete = d }) {
                                 Icon(Icons.Default.DeleteOutline, "Delete")
                             }
                         }
@@ -141,6 +144,33 @@ fun LibraryScreen(app: PdferApp, onOpen: (String) -> Unit) {
             onDismissRequest = { importError = null },
             confirmButton = { TextButton(onClick = { importError = null }) { Text("OK") } },
             title = { Text("Couldn’t open PDF") },
+            text = { Text(msg) },
+        )
+    }
+
+    pendingDelete?.let { doc ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete PDF?") },
+            text = { Text("“${doc.title}” and its recognized-text cache will be removed from this device.") },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDelete = null
+                    scope.launch {
+                        runCatching { app.library.delete(doc) }
+                            .onFailure { deleteError = it.message ?: "Could not delete this PDF." }
+                    }
+                }) { Text("Delete") }
+            },
+        )
+    }
+
+    deleteError?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { deleteError = null },
+            confirmButton = { TextButton(onClick = { deleteError = null }) { Text("OK") } },
+            title = { Text("Couldn’t delete PDF") },
             text = { Text(msg) },
         )
     }

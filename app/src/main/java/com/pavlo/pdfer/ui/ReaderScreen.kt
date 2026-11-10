@@ -41,9 +41,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -97,6 +99,7 @@ fun ReaderScreen(app: PdferApp, docId: String, onBack: () -> Unit) {
     val bestDownload by vm.bestDownload.collectAsState()
     val searchState by vm.searchState.collectAsState()
     val highlight by vm.highlight.collectAsState()
+    val progressError by vm.progressError.collectAsState()
 
     var showSettings by remember { mutableStateOf(false) }
     var showOriginal by remember { mutableStateOf(false) }
@@ -192,11 +195,23 @@ fun ReaderScreen(app: PdferApp, docId: String, onBack: () -> Unit) {
         }
     }
 
+    progressError?.let { message ->
+        AlertDialog(
+            onDismissRequest = vm::dismissProgressError,
+            title = { Text("Couldn’t save progress") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = vm::dismissProgressError) { Text("OK") }
+            },
+        )
+    }
+
     if (showSettings) {
         SettingsSheet(
             settings = settings,
             bestDownload = bestDownload,
             onChange = { scope.launch { app.settings.update(it) } },
+            onRetryBest = vm::retryBestDownload,
             onDismiss = { showSettings = false },
         )
     }
@@ -427,9 +442,14 @@ private fun SettingsSheet(
     settings: ReaderSettings,
     bestDownload: DownloadState,
     onChange: (ReaderSettings) -> Unit,
+    onRetryBest: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState()
+    // Slider movement is the hot path: it only updates local display state. DataStore
+    // is written once when the gesture finishes.
+    var fontSize by remember(settings.fontSizeSp) { mutableStateOf(settings.fontSizeSp.toFloat()) }
+    var lineHeight by remember(settings.lineHeightMult) { mutableStateOf(settings.lineHeightMult) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         Column(
             Modifier
@@ -438,16 +458,25 @@ private fun SettingsSheet(
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Text size: ${settings.fontSizeSp}sp", style = MaterialTheme.typography.titleSmall)
+            Text("Text size: ${fontSize.toInt()}sp", style = MaterialTheme.typography.titleSmall)
             Slider(
-                value = settings.fontSizeSp.toFloat(),
-                onValueChange = { onChange(settings.copy(fontSizeSp = it.toInt())) },
+                value = fontSize,
+                onValueChange = { fontSize = it },
+                onValueChangeFinished = {
+                    val committed = fontSize.toInt()
+                    if (committed != settings.fontSizeSp) onChange(settings.copy(fontSizeSp = committed))
+                },
                 valueRange = 13f..34f,
             )
-            Text("Line spacing: ${"%.1f".format(settings.lineHeightMult)}×", style = MaterialTheme.typography.titleSmall)
+            Text("Line spacing: ${"%.1f".format(lineHeight)}×", style = MaterialTheme.typography.titleSmall)
             Slider(
-                value = settings.lineHeightMult,
-                onValueChange = { onChange(settings.copy(lineHeightMult = (it * 10).toInt() / 10f)) },
+                value = lineHeight,
+                onValueChange = { lineHeight = (it * 10).toInt() / 10f },
+                onValueChangeFinished = {
+                    if (lineHeight != settings.lineHeightMult) {
+                        onChange(settings.copy(lineHeightMult = lineHeight))
+                    }
+                },
                 valueRange = 1.1f..2.2f,
             )
             Text("Theme", style = MaterialTheme.typography.titleSmall)
@@ -510,11 +539,14 @@ private fun SettingsSheet(
                     Text("Downloading best models… ${(d.progress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
                     LinearProgressIndicator(progress = { d.progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
                 }
-                DownloadState.Failed -> Text(
-                    "Download failed — using Fast. Check connection and reselect Best.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
+                DownloadState.Failed -> Column {
+                    Text(
+                        "Download failed — using Fast. Check connection and try again.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    TextButton(onClick = onRetryBest) { Text("Retry") }
+                }
                 else -> if (settings.quality == OcrQuality.BEST) Text(
                     "Best: slower but more accurate on poor scans.",
                     style = MaterialTheme.typography.bodySmall,
